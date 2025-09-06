@@ -1223,11 +1223,25 @@ ordering_agent = Agent(model_nano,
                                     3) RETURN (with no transaction created).
                                     """)
 
-general_agent = Agent(model,
+data_extraction_agent = Agent(model,
                       deps_type=Deps,
                       retries=3,
-                      system_prompt=("You are a generic agent tasked with executing orders faithfully.")
-                      )
+                      system_prompt=f"""You are a data extraction agent. 
+                      
+                                        Your purpose is to accurately extract details from a customer request. 
+                                        
+                                        Your goal is to fill the following:
+                                         - goals_of_request: What the customer is looking to get back (e.g. order fullfilled for items)
+                                         - request_date: when the request was made according to the text, not your system time 
+                                         - items_names_requested_from_customer: A list of items requested by the client 
+                                         - items_names_requested_match_from_financial_report: find closest matches in the financial report item_names to the 
+                                         item_names_requested_from_customer items 
+                                         - number_of_items_requested: quantity of each item requested 
+                                         - desired_delivery_date: When the customer asked the order to be delivered to them by.
+                                        
+                                        desired output follows this format: 
+                                        {json.dumps(EmailDetails.model_json_schema(), indent=2)}""")
+                                                        
 
 
 """Set up tools for your agents to use, these should be methods that combine the database functions above
@@ -1347,7 +1361,7 @@ async def record_email_details(ctx: RunContext[Deps], prompt: str) -> EmailDetai
     items_names_requested_match_from_financial_report, number_of_items_requested, desired_delivery_date in
     the user prompt and adds it to the shared state.
 
-    :param prompt - the user prompt
+    :param prompt - the user prompt a.k.a. the request from the customer
 
     :return EmailDetails. """
 
@@ -1356,7 +1370,7 @@ async def record_email_details(ctx: RunContext[Deps], prompt: str) -> EmailDetai
                     When financial_report is present, match each customer item name to exactly ONE item_name from it.
                     financial report: {ctx.deps.state.financial_report}"""
 
-    response = await general_agent.run(instructions, output_type=EmailDetails, deps=ctx.deps)
+    response = await data_extraction_agent.run(instructions, output_type=EmailDetails, deps=ctx.deps)
     result_details = response.output
 
     ctx.deps.state.goals_of_request.extend(result_details.goals_of_request)
@@ -1704,15 +1718,6 @@ def run_test_scenarios():
 
         response_orc = orchestration_agent.run_sync(prompt, deps=deps, output_type=OrchestrationResponse)
         response_details = response_orc.output
-
-        if not response_details or not response_details.response_to_client:
-            fallback_notes = "Compose a clear customer response using the current shared state."
-            final_text = asyncio.run(
-                write_response_to_customer(ctx=RunContext(deps), prompt=prompt, notes=fallback_notes))
-            response_details = OrchestrationResponse(
-                internal_response="Fallback packaging invoked.",
-                response_to_client=final_text
-            )
 
         with open(filename, "w") as f:
             f.write(f"internal_response: {response_details.internal_response}\n ")
