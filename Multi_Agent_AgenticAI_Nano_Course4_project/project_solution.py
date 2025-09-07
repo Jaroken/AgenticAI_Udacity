@@ -13,7 +13,7 @@ from typing import Dict, List, Union, Literal, Optional
 from sqlalchemy import create_engine, Engine
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
-from pydantic_ai import Agent, RunContext
+from pydantic_ai import Agent, RunContext, UsageLimits
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from enum import Enum
@@ -739,6 +739,17 @@ class InventoryItemSummary(BaseModel):
     unit_price: float
     value: float
 
+class InventoryNeeded(BaseModel):
+    item_name: str = Field(..., decriptipon="Name of the item")
+    quantity: int = Field(..., description="The number of items needed to stock order for inventory to meet customer request")
+
+class InventoryItem(BaseModel):
+    item_name: str = Field(..., decriptipon="Name of the item")
+    quantity: int = Field(..., description="The number of items needed to stock order for inventory to meet customer request")
+
+class InventoryListNeed(BaseModel):
+    needed: List[InventoryItem]
+
 class TopSellingProduct(BaseModel):
     item_name: str
     total_units: int
@@ -762,12 +773,13 @@ class SharedState(BaseModel):
     request_date: Optional[date] = None
     items_names_requested_from_customer: List[str] = Field(default_factory=list)
     items_names_requested_match_from_financial_report: List[str] = Field(default_factory=list)
-    number_of_items_requested: List[int] = Field(default_factory=list)
+    quantity_of_items_requested: List[int] = Field(default_factory=list)
+    quantity_of_items_stock_order:  List[InventoryNeeded]  = Field(default_factory=list)
     desired_delivery_date: Optional[date] = None
     shipping_address: Optional[Address] = None
     inventory_levels_of_all_products: Dict[str, float] = Field(default_factory=dict)
     stock_level_specific_items: List[StockLevel] = Field(default_factory=list)
-    quote_history: List[Dict] = Field(default_factory=list)
+    quote_history: List[str] = Field(default_factory=list)
     cash_balance: Optional[float] = None
     financial_report: Optional[FinancialReport] = None
     supplier_delivery_date: List[SupplierDelivery] = Field(default_factory=list)
@@ -782,7 +794,7 @@ class EmailDetails(BaseModel):
     request_date: Optional[date] = None
     items_names_requested_from_customer: List[str] = Field(default_factory=list)
     items_names_requested_match_from_financial_report: List[str] = Field(default_factory=list)
-    number_of_items_requested: List[int] = Field(default_factory=list)
+    quantity_of_items_requested: List[int] = Field(default_factory=list)
     desired_delivery_date: Optional[date] = None
 
 class WorkerOutput(BaseModel):
@@ -844,9 +856,10 @@ orchestration_agent = Agent(model,
                                 1) finalize_output
                                 2) record_email_details
                                 3) get_delivery_address
-                                3) call_inventory_manager
-                                4) call_quoting_manager
-                                5) call_ordering_manager
+                                4) determine_stock_needs
+                                5) call_inventory_manager
+                                6) call_quoting_manager
+                                7) call_ordering_manager
                                 
                                 
                                 
@@ -854,16 +867,17 @@ orchestration_agent = Agent(model,
                                 Step 1: call generate_financial_report_dict  with the request date.
                                 Step 2: Call record_email_details on the original customer prompt.
                                 Step 3: Call get_delivery_address
-                                Step 4: Check inventory available, call inventory manager
-                                Step 5: Set price to customer, call quoting manager
-                                Step 6: Check delivery timing, call ordering manager
-                                Step 7: If there is insufficient stock quantity to complete the sale order to customer, 
+                                Step 4: Check inventory available, call inventory manager, request calling get_stock_level_item
+                                Step 5: Call determine_stock_needs
+                                Step 6: Set price to customer, call quoting manager
+                                Step 7: Check delivery timing, call ordering manager. 
+                                Step 8: If there is insufficient stock quantity to complete the sale order to customer, 
                                 call ordering manager to order stock
-                                Step 8: Reason which items are viable: can be delivered on or before desired delivery date. 
-                                Step 9: Call ordering manager to place sales order for viable items 
-                                Step 10: Summarize actions + results
+                                Step 9: Reason which items are viable: can be delivered on or before desired delivery date. 
+                                Step 10: Call ordering manager to place sales order for viable items 
+                                Step 11: Summarize actions + results
                                 WAIT UNTIL ALL STEPS ABOVE ARE FINISHED
-                                Step 11: Return OrchestrationResponse
+                                Step 12: Return OrchestrationResponse
                                 
                                 Desired Output schema:
                                 {json.dumps(OrchestrationResponse.model_json_schema(), indent=2)}"""
@@ -1202,7 +1216,7 @@ ordering_agent = Agent(model_nano,
                                     Plan: 
                                     1) get_supplier_delivery_date_estimate('Glossy paper','2025-04-01',200) 
                                     2) derive customer start date from supplier ETA 
-                                    3) get_customer_delivery_date_estimate(...) 
+                                    3) get_customer_delivery_date_estimate 
                                     4) if price provided 
                                     5) create_transaction_record('Glossy paper','sales',200,price,'2025-04-01') 
                                     6) RETURN.
@@ -1236,7 +1250,7 @@ data_extraction_agent = Agent(model,
                                          - items_names_requested_from_customer: A list of items requested by the client 
                                          - items_names_requested_match_from_financial_report: find closest matches in the financial report item_names to the 
                                          item_names_requested_from_customer items 
-                                         - number_of_items_requested: quantity of each item requested 
+                                         - quantity_of_items_requested: quantity of each item requested 
                                          - desired_delivery_date: When the customer asked the order to be delivered to them by.
                                         
                                         desired output follows this format: 
@@ -1268,22 +1282,17 @@ async def call_quoting_manager(ctx:RunContext[Deps], request:OrchestrationCall) 
     :param request: {}
     :return:
     """.format(json.dumps(OrchestrationCall.model_json_schema(), indent=2))
+    try:
+        instructions = (f"""Goal: {request.goal}
+                    Items requested: {ctx.deps.state.items_names_requested_match_from_financial_report}
+                    Notes for accomplishing goal: {request.notes_for_agent}""")
 
-    instructions = (f"\nGoal: {request.goal}\n"
-                   f"\nNotes for accomplishing goal: {request.notes_for_agent}\n ")
-
-    response_from_quoting = await quoting_agent.run(deps=ctx.deps,user_prompt= instructions, output_type=WorkerOutput)
-
-    return response_from_quoting.output
-
-
-
-
-
-"inputs:"
-"-- as_of_date (str): ISO-formatted date string (YYYY-MM-DD) representing the inventory cutoff date. "
-"Default to request date from user input."
-
+        response_from_quoting = await quoting_agent.run(deps=ctx.deps,user_prompt= instructions, output_type=WorkerOutput)
+        return response_from_quoting.output
+    except Exception as e:
+        print(e)
+        return(str(e))
+    
 
 @orchestration_agent.tool
 async def call_ordering_manager(ctx:RunContext[Deps], request:OrchestrationCall) -> WorkerOutput:
@@ -1311,17 +1320,28 @@ async def call_ordering_manager(ctx:RunContext[Deps], request:OrchestrationCall)
        date_of_trans (str or datetime): Date of the transaction in ISO 8601 format.
 
 
-    :param ctx:
+    :param ctx: 
     :param request: {}
     :return:
     """.format(json.dumps(OrchestrationCall.model_json_schema(), indent=2))
 
-    instructions = (f"\nGoal: {request.goal}\n"
-                   f"\nNotes for accomplishing goal: {request.notes_for_agent}\n ")
+    try:
+        instructions = (f"""Goal: {request.goal}
+                        Date request from customer was made (request_date): {ctx.deps.state.request_date}
+                        Inventory needed: {ctx.deps.state.quantity_of_items_stock_order}
+                        Items requested: {ctx.deps.state.items_names_requested_match_from_financial_report}
+                        Quantity requested by customer: {ctx.deps.state.quantity_of_items_requested}
+                        Supplier delivery dates: {ctx.deps.state.supplier_delivery_date}
+                        Customer delivery dates: {ctx.deps.state.customer_delivery_date}
+                        Notes for accomplishing goal: {request.notes_for_agent}""")
 
-    response_from_ordering = await ordering_agent.run(deps=ctx.deps,user_prompt= instructions, output_type=WorkerOutput)
-
-    return response_from_ordering.output
+        response_from_ordering = await ordering_agent.run(deps=ctx.deps,user_prompt= instructions, output_type=WorkerOutput)
+        print('successfully ran call_ordering_manager')
+        return response_from_ordering.output
+    except Exception as e:
+        print(e)
+        return str(e)
+    
 
 
 
@@ -1345,42 +1365,87 @@ async def call_inventory_manager(ctx:RunContext[Deps], request:OrchestrationCall
     :param request: {}
     :return:
     """.format(json.dumps(OrchestrationCall.model_json_schema(), indent=2))
+    try:
+        instructions = (f"""Goal: {request.goal}
+                        Date request from customer was made (request_date): {ctx.deps.state.request_date}
+                        Items requested: {ctx.deps.state.items_names_requested_match_from_financial_report}
+                        Quantity requested by customer: {ctx.deps.state.quantity_of_items_requested}
+                        Notes for accomplishing goal: {request.notes_for_agent}""")
 
-    instructions = (f"\nGoal: {request.goal}\n"
-                   f"\nNotes for accomplishing goal: {request.notes_for_agent}\n ")
+        response_from_inventory = await inventory_agent.run(deps=ctx.deps,user_prompt= instructions, output_type=WorkerOutput)
+        return response_from_inventory.output
+    except Exception as e:
+        print(e)
+        return str(e)
+    
 
-    response_from_inventory = await inventory_agent.run(deps=ctx.deps,user_prompt= instructions, output_type=WorkerOutput)
+@orchestration_agent.tool
+async def determine_stock_needs(ctx: RunContext[Deps]) -> list:
+    """Asks the Inventory Manager to calculate the needed quantity of stock_orders. Must have the following to calculate need.
+    - items_names_requested_match_from_financial_report: The internal name of the items
+    - quantity_of_items_requested: the amount the customer requested
+    - stock_level_specific_items: the current stock quantity of the items requested
+    with these values you should be able to fill in the quantity_of_items_stock_order
 
-    return response_from_inventory.output
+    Output: Quantity of Stock needed"""
+    try:
+        instructions = f"""Please calculate the quantity_of_items_stock_order (the quantity needed to stock order).
+                        
+                        You need the following variables to calculate this value:
+                        - items_names_requested_match_from_financial_report: The internal name of the items
+                        - quantity_of_items_requested: the amount the customer requested
+                        - stock_level_specific_items: the current stock quantity of the items requested
+                        
+                        - items_names_requested_match_from_financial_report: : {ctx.deps.state.items_names_requested_match_from_financial_report}
+                        - quantity_of_items_requested: {ctx.deps.state.quantity_of_items_requested}
+                        - stock_level_specific_items: {ctx.deps.state.stock_level_specific_items}
+
+                        return: list
+
+                        """
+
+        response = await inventory_agent.run(instructions, output_type=InventoryListNeed, deps=ctx.deps)
+        result_details = response.output
+
+        ctx.deps.state.quantity_of_items_stock_order.extend(result_details.needed)
+    
+        return result_details
+    except Exception as e:
+        print(e)
+        return str(e)
+
 
 
 @orchestration_agent.tool
 async def record_email_details(ctx: RunContext[Deps], prompt: str) -> EmailDetails:
     """Extracts details from the user prompt (email or request from customer).
     Looks for goals_of_request, request_date, items_names_requested_from_customer, matches and finds
-    items_names_requested_match_from_financial_report, number_of_items_requested, desired_delivery_date in
+    items_names_requested_match_from_financial_report, quantity_of_items_requested, desired_delivery_date in
     the user prompt and adds it to the shared state.
 
     :param prompt - the user prompt a.k.a. the request from the customer
 
     :return EmailDetails. """
+    try:
+        instructions = f"""Message to extract details from:{prompt}
+                        If financial_report is missing or empty, proceed using item names verbatim.
+                        When financial_report is present, match each customer item name to exactly ONE item_name from it.
+                        financial report: {ctx.deps.state.financial_report}"""
 
-    instructions = f"""Message to extract details from:{prompt}
-                    If financial_report is missing or empty, proceed using item names verbatim.
-                    When financial_report is present, match each customer item name to exactly ONE item_name from it.
-                    financial report: {ctx.deps.state.financial_report}"""
+        response = await data_extraction_agent.run(instructions, output_type=EmailDetails, deps=ctx.deps)
+        result_details = response.output
 
-    response = await data_extraction_agent.run(instructions, output_type=EmailDetails, deps=ctx.deps)
-    result_details = response.output
+        ctx.deps.state.goals_of_request.extend(result_details.goals_of_request)
+        ctx.deps.state.request_date = result_details.request_date
+        ctx.deps.state.items_names_requested_from_customer.extend(result_details.items_names_requested_from_customer)
+        ctx.deps.state.items_names_requested_match_from_financial_report.extend(result_details.items_names_requested_match_from_financial_report)
+        ctx.deps.state.quantity_of_items_requested.extend(result_details.quantity_of_items_requested)
+        ctx.deps.state.desired_delivery_date = result_details.desired_delivery_date
 
-    ctx.deps.state.goals_of_request.extend(result_details.goals_of_request)
-    ctx.deps.state.request_date = result_details.request_date
-    ctx.deps.state.items_names_requested_from_customer.extend(result_details.items_names_requested_from_customer)
-    ctx.deps.state.items_names_requested_match_from_financial_report.extend(result_details.items_names_requested_match_from_financial_report)
-    ctx.deps.state.number_of_items_requested.extend(result_details.number_of_items_requested)
-    ctx.deps.state.desired_delivery_date = result_details.desired_delivery_date
-
-    return result_details
+        return result_details
+    except Exception as e:
+        print(e)
+        return str(e)
 
 
 def generate_delivery_address():
@@ -1419,7 +1484,7 @@ async def get_delivery_address(ctx: RunContext[Deps]) -> str:
 
     :return str of customer address.
     """
-
+    
     output = generate_delivery_address()
     ctx.deps.state.shipping_address = output
     return output
@@ -1443,21 +1508,23 @@ async def generate_financial_report_dict(ctx: RunContext[Deps], as_of_date: Unio
 
     :return FinancialReport.
     """
+    try:
+        output = generate_financial_report(as_of_date)
 
-    output = generate_financial_report(as_of_date)
+        financial_repo = FinancialReport(
+            as_of_date=output["as_of_date"],
+            cash_balance=output["cash_balance"],
+            inventory_value=output["inventory_value"],
+            total_assets=output["total_assets"],
+            inventory_summary=[InventoryItemSummary(**row) for row in output["inventory_summary"]],
+            top_selling_products=[TopSellingProduct(**row) for row in output["top_selling_products"]],
+        )
 
-    financial_repo = FinancialReport(
-        as_of_date=output["as_of_date"],
-        cash_balance=output["cash_balance"],
-        inventory_value=output["inventory_value"],
-        total_assets=output["total_assets"],
-        inventory_summary=[InventoryItemSummary(**row) for row in output["inventory_summary"]],
-        top_selling_products=[TopSellingProduct(**row) for row in output["top_selling_products"]],
-    )
+        ctx.deps.state.financial_report = financial_repo
 
-    ctx.deps.state.financial_report = financial_repo
-
-    return financial_repo
+        return financial_repo
+    except Exception as e:
+        print(e)
 
 # Tools for inventory agent
 @inventory_agent.tool
@@ -1476,10 +1543,12 @@ async def get_inventory_for_date(ctx: RunContext[Deps], as_of_date: str) -> dict
     :param as_of_date (str): ISO-formatted date string (YYYY-MM-DD) representing the inventory cutoff date. Default to request date from user input.
     :return dict of inventory report.
     """
-
-    output = get_all_inventory(as_of_date)
-    ctx.deps.state.inventory_levels_of_all_products = dict(output)
-    return dict(output)
+    try:
+        output = get_all_inventory(as_of_date)
+        ctx.deps.state.inventory_levels_of_all_products = dict(output)
+        return dict(output)
+    except Exception as e:
+        print(e)
 
 
 
@@ -1505,22 +1574,23 @@ async def get_stock_level_item(ctx: RunContext[Deps], item_name: str, as_of_date
     :param as_of_date (str or datetime): The cutoff date (inclusive) for calculating stock. Default to request date from user input.
     :return StockLevel.
     """
+    try:
+        df = get_stock_level(item_name, as_of_date)
+        if df.empty:
+            record_found = False
+            current_stock = 0.0
+        else:
+            row = df.iloc[0]
+            record_found  = True
 
-    df = get_stock_level(item_name, as_of_date)
-    if df.empty:
-        record_found = False
-        current_stock = 0.0
-    else:
-        row = df.iloc[0]
-        record_found  = True
-
-        current_stock = float(row["current_stock"])
-    stock_level = StockLevel(item_name=item_name, current_stock=current_stock, record_found = record_found)
-    ctx.deps.state.stock_level_specific_items.append(
-        stock_level
-    )
-    return stock_level
-
+            current_stock = float(row["current_stock"])
+        stock_level = StockLevel(item_name=item_name, current_stock=current_stock, record_found = record_found)
+        ctx.deps.state.stock_level_specific_items.append(
+            stock_level
+        )
+        return stock_level
+    except Exception as e:
+            print(e)
 
 
 
@@ -1540,11 +1610,15 @@ async def search_quote_history_retrieve(ctx: RunContext[Deps], search_terms: Lis
 
     :return list of historical quotes.
     """
+    try:
+    
+        output = search_quote_history(search_terms, limit)
+        ctx.deps.state.quote_history.extend(str(output))
+    
 
-    output = search_quote_history(search_terms, limit)
-    ctx.deps.state.quote_history.extend(output)
-
-    return output
+        return output
+    except Exception as e:
+        print(e)
 
 
 
@@ -1555,11 +1629,14 @@ async def get_cash_balance_value(ctx: RunContext[Deps], as_of_date: Union[str, d
     :param as_of_date (str or datetime): The cutoff date (inclusive) in ISO format or as a datetime object.
 
     :return float.
-    """
+    """ 
+    try:
 
-    output = get_cash_balance(as_of_date)
-    ctx.deps.state.cash_balance = output
-    return output
+        output = get_cash_balance(as_of_date)
+        ctx.deps.state.cash_balance = output
+        return output
+    except Exception as e:
+        print(e)
 
 
 
@@ -1582,18 +1659,20 @@ async def get_supplier_delivery_date_estimate(ctx: RunContext[Deps], item_name: 
 
     :return SupplierDelivery: The date the item will arrive into  Beaver's Choice Paper Company inventory.
     """
-
-    output = get_supplier_delivery_date(input_date_str, quantity)
-    delivery_details = SupplierDelivery(
-                item_name=item_name,
-                starting_date=datetime.strptime(input_date_str, "%Y-%m-%d").date(),
-                quantity=quantity,
-                supplier_delivery_date=datetime.strptime(output, "%Y-%m-%d").date(),
+    try:
+        output = get_supplier_delivery_date(input_date_str, quantity)
+        delivery_details = SupplierDelivery(
+                    item_name=item_name,
+                    starting_date=datetime.strptime(input_date_str, "%Y-%m-%d").date(),
+                    quantity=quantity,
+                    supplier_delivery_date=datetime.strptime(output, "%Y-%m-%d").date(),
+                )
+        ctx.deps.state.supplier_delivery_date.append(
+            delivery_details
             )
-    ctx.deps.state.supplier_delivery_date.append(
-        delivery_details
-        )
-    return delivery_details
+        return delivery_details
+    except Exception as e:
+        print(e)
 
 
 
@@ -1616,18 +1695,20 @@ async def get_customer_delivery_date_estimate(ctx: RunContext[Deps], item_name: 
 
     :return CustomerDelivery: The date the item will arrive to the customer.
     """
-
-    output = get_customer_delivery_date(input_date_str, quantity)
-    delivery_details = CustomerDelivery(
-                item_name=item_name,
-                starting_date=datetime.strptime(input_date_str, "%Y-%m-%d").date(),
-                quantity=quantity,
-                customer_delivery_date=datetime.strptime(output, "%Y-%m-%d").date(),
+    try:
+        output = get_customer_delivery_date(input_date_str, quantity)
+        delivery_details = CustomerDelivery(
+                    item_name=item_name,
+                    starting_date=datetime.strptime(input_date_str, "%Y-%m-%d").date(),
+                    quantity=quantity,
+                    customer_delivery_date=datetime.strptime(output, "%Y-%m-%d").date(),
+                )
+        ctx.deps.state.customer_delivery_date.append(
+            delivery_details
             )
-    ctx.deps.state.customer_delivery_date.append(
-        delivery_details
-        )
-    return delivery_details
+        return delivery_details
+    except Exception as e:
+        print(e)
 
 @ordering_agent.tool
 async def create_transaction_record(ctx: RunContext[Deps], item_name: str, transaction_type: Literal["stock_orders","sales"],
@@ -1649,19 +1730,21 @@ async def create_transaction_record(ctx: RunContext[Deps], item_name: str, trans
 
     :return OrderRecord.
     """
+    try:
+        output = create_transaction(item_name, transaction_type, quantity, price, date_of_trans)
+        order_record = OrderRecord(item_name=item_name,
+                                                        transaction_type=transaction_type,
+                                                        quantity= quantity,
+                                                        price=price,
+                                                        date=date_of_trans,
+                                                        transaction_id=output
+                                                        )
+        ctx.deps.state.orders_completed.append(order_record)
 
-    output = create_transaction(item_name, transaction_type, quantity, price, date_of_trans)
-    order_record = OrderRecord(item_name=item_name,
-                                                       transaction_type=transaction_type,
-                                                       quantity= quantity,
-                                                       price=price,
-                                                       date=date_of_trans,
-                                                       transaction_id=output
-                                                       )
-    ctx.deps.state.orders_completed.append(order_record)
 
-
-    return order_record
+        return order_record
+    except Exception as e:
+        print(e)
 
 
 
@@ -1716,9 +1799,11 @@ def run_test_scenarios():
             f.write(f"Prompt: {prompt}\n ")
         print(f"Prompt: {prompt}\n ")
 
-        response_orc = orchestration_agent.run_sync(prompt, deps=deps, output_type=OrchestrationResponse)
+        #try:
+        response_orc = orchestration_agent.run_sync(prompt, deps=deps, output_type=OrchestrationResponse,  
+        usage_limits=UsageLimits(request_limit=200))
         response_details = response_orc.output
-
+    
         with open(filename, "w") as f:
             f.write(f"internal_response: {response_details.internal_response}\n ")
         print(f"internal_response: {response_details.internal_response}\n ")
@@ -1728,7 +1813,7 @@ def run_test_scenarios():
         print(f"response_to_client: {response_details.response_to_client}\n ")
 
         return response_details
-
+    
 
     results = []
     for idx, row in quote_requests_sample.iterrows():
@@ -1751,8 +1836,10 @@ def run_test_scenarios():
         ############
         ############
 
-        response = run_agentic_process(request_with_date) # Running Multi Agent System Here.
-
+        try:
+            response = run_agentic_process(request_with_date) # Running Multi Agent System Here.
+        except:
+            response = run_agentic_process(request_with_date)
         # Update state
         report = generate_financial_report(request_date)
         current_cash = report["cash_balance"]
